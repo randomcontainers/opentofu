@@ -1,0 +1,252 @@
+name: opentofu
+title: OpenTofu
+summary: Plans, applies and tests infrastructure changes described in OpenTofu configuration files, with the tofu command-line tool.
+homepage: https://opentofu.org/
+# OpenTofu (MPL-2.0, with code from Go's net package under BSD-3-Clause in
+# internal/ipaddr) and the Go modules linked into it: MPL-2.0 (the HashiCorp
+# libraries, OpenTofu's hcl fork, the OpenBao API client, mitchellh/cli),
+# Apache-2.0, MIT, BSD-3-Clause (also the Go standard library), BSD-2-Clause,
+# ISC, and the Unicode data in go-textseg: Unicode-DFS-2016 for v15 and
+# Unicode-3.0 for v17. go-digest's LICENSE.docs (CC-BY-SA-4.0) covers its
+# documentation, which is not compiled in. The release of each version carries
+# OpenTofu's source, and the image carries the source zips of the MPL-2.0
+# modules.
+license: MPL-2.0 AND Apache-2.0 AND MIT AND BSD-3-Clause AND BSD-2-Clause AND ISC AND Unicode-DFS-2016 AND Unicode-3.0
+source-release: true
+upstream:
+  source: github-release
+  repository: opentofu/opentofu
+  # goreleaser drafts each release and a maintainer publishes it; drafts are
+  # not read. Patch releases of an older series, such as 1.12.8 after 1.13.1,
+  # sort below the current version and are not built.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 1.13.1
+  # The release assets are prebuilt binaries and packages, with no source
+  # tarball, so the build compiles the tag.
+  git:
+    url: https://github.com/opentofu/opentofu.git
+    tag: v{version}
+    commit: 233700b795b6d2372f1c56ed57a4abaec9d36475
+image:
+  entrypoint: [tofu]
+  cmd: [--help]
+test:
+  - |
+    tofu version > version.txt
+    sed -n 1p version.txt > version.first
+    printf '%s\n' "OpenTofu v$VERSION" > version.want
+    cmp version.want version.first || { echo "expected 'OpenTofu v$VERSION', got:" >&2; cat version.txt >&2; exit 1; }
+    case "$(sed -n 2p version.txt)" in
+      'on linux_amd64' | 'on linux_arm64') ;;
+      *) echo "unexpected platform line:" >&2; cat version.txt >&2; exit 1 ;;
+    esac
+    tofu version -json > version.json
+    grep -Fq "\"terraform_version\": \"$VERSION\"," version.json || { cat version.json >&2; exit 1; }
+  - |
+    # fmt -check lists the files that need formatting and exits with 3.
+    mkdir fmt
+    printf '%s\n' 'variable "who" {' 'type=string' '  default =   "world"' '}' > fmt/main.tf
+    if tofu fmt -check fmt > fmt.txt 2>&1; then status=0; else status=$?; fi
+    test "$status" -eq 3 || { cat fmt.txt >&2; echo "expected exit status 3, got $status" >&2; exit 1; }
+    grep -Fqx fmt/main.tf fmt.txt || { cat fmt.txt >&2; exit 1; }
+    tofu fmt fmt > fmt.txt
+    printf '%s\n' 'variable "who" {' '  type    = string' '  default = "world"' '}' > fmt.want
+    cmp fmt.want fmt/main.tf || { cat fmt/main.tf >&2; exit 1; }
+    tofu fmt -check fmt > fmt.txt 2>&1 || { cat fmt.txt >&2; exit 1; }
+  - |
+    # A local module and terraform_data, which belongs to the built-in
+    # provider, so init and apply need no network.
+    mkdir -p apply/modules/greet apply/tests
+    cat > apply/modules/greet/main.tf <<'EOF'
+    variable "who" {
+      type = string
+    }
+
+    output "text" {
+      value = "hello ${var.who}"
+    }
+    EOF
+    cat > apply/main.tf <<'EOF'
+    variable "who" {
+      type = string
+    }
+
+    module "greet" {
+      source = "./modules/greet"
+      who    = var.who
+    }
+
+    resource "terraform_data" "greeting" {
+      input = module.greet.text
+    }
+
+    output "greeting" {
+      value = terraform_data.greeting.output
+    }
+    EOF
+    cd apply || exit 1
+    tofu init -input=false -no-color > init.txt 2>&1 || { cat init.txt >&2; exit 1; }
+    tofu apply -auto-approve -input=false -no-color -var who=world > apply.txt 2>&1 || { cat apply.txt >&2; exit 1; }
+    tofu output -raw greeting > greeting.txt
+    printf 'hello world' > greeting.want
+    cmp greeting.want greeting.txt || { cat greeting.txt >&2; exit 1; }
+    grep -Fq '"hello world"' terraform.tfstate || { cat terraform.tfstate >&2; exit 1; }
+    # tofu test applies each run with its own state and destroys it again.
+    cat > tests/greet.tftest.hcl <<'EOF'
+    variables {
+      who = "test"
+    }
+
+    run "greeting" {
+      assert {
+        condition     = output.greeting == "hello test"
+        error_message = "unexpected greeting: ${output.greeting}"
+      }
+    }
+    EOF
+    tofu test -no-color > test.txt 2>&1 || { cat test.txt >&2; exit 1; }
+    grep -Fqx 'Success! 1 passed, 0 failed.' test.txt || { cat test.txt >&2; exit 1; }
+    sed 's/"hello test"/"goodbye test"/' tests/greet.tftest.hcl > tests/fail.tftest.hcl
+    if tofu test -no-color > test.txt 2>&1; then
+      cat test.txt >&2; echo "tofu test passed with a failing assertion" >&2; exit 1
+    fi
+    grep -Fqx 'Failure! 1 passed, 1 failed.' test.txt || { cat test.txt >&2; exit 1; }
+  - |
+    # State encryption with a passphrase. The state file holds only the
+    # encrypted payload, and a wrong passphrase cannot read it.
+    mkdir crypt
+    cd crypt || exit 1
+    cat > main.tf <<'EOF'
+    variable "passphrase" {
+      type      = string
+      sensitive = true
+    }
+
+    terraform {
+      encryption {
+        key_provider "pbkdf2" "main" {
+          passphrase = var.passphrase
+        }
+        method "aes_gcm" "main" {
+          keys = key_provider.pbkdf2.main
+        }
+        state {
+          method   = method.aes_gcm.main
+          enforced = true
+        }
+      }
+    }
+
+    resource "terraform_data" "secret" {
+      input = "kept out of the state file"
+    }
+
+    output "secret" {
+      value = terraform_data.secret.output
+    }
+    EOF
+    TF_VAR_passphrase=correct-horse-battery-staple
+    export TF_VAR_passphrase
+    tofu init -input=false -no-color > init.txt 2>&1 || { cat init.txt >&2; exit 1; }
+    tofu apply -auto-approve -input=false -no-color > apply.txt 2>&1 || { cat apply.txt >&2; exit 1; }
+    grep -Fq '"encrypted_data"' terraform.tfstate || { cat terraform.tfstate >&2; exit 1; }
+    if grep -Fq 'kept out of the state file' terraform.tfstate; then
+      echo "the state file holds the output in plain text" >&2; exit 1
+    fi
+    tofu output -raw secret > secret.txt
+    printf 'kept out of the state file' > secret.want
+    cmp secret.want secret.txt || { cat secret.txt >&2; exit 1; }
+    if TF_VAR_passphrase=wrong-horse-battery-staple tofu output -raw secret > wrong.txt 2>&1; then
+      cat wrong.txt >&2; echo "the state was read with the wrong passphrase" >&2; exit 1
+    fi
+  - |
+    # Functions of the built-in provider and cidrsubnet, which uses the code
+    # from Go's net package in internal/ipaddr. The console can call a
+    # provider's functions only when the configuration calls one of them too
+    # (opentofu/opentofu#4631), hence the local value.
+    mkdir console
+    cd console || exit 1
+    cat > main.tf <<'EOF'
+    terraform {
+      required_providers {
+        terraform = {
+          source = "terraform.io/builtin/terraform"
+        }
+      }
+    }
+
+    locals {
+      tfvars = provider::terraform::encode_tfvars({ who = "tofu" })
+    }
+    EOF
+    tofu init -input=false -no-color > init.txt 2>&1 || { cat init.txt >&2; exit 1; }
+    printf '%s\n' \
+      'provider::terraform::decode_tfvars(local.tfvars).who' \
+      'cidrsubnet("10.1.0.0/16", 8, 2)' | tofu console -no-color > console.txt 2> console.err \
+      || { cat console.err console.txt >&2; exit 1; }
+    printf '%s\n' '"tofu"' '"10.1.2.0/24"' > console.want
+    cmp console.want console.txt || { cat console.err console.txt >&2; exit 1; }
+  - |
+    # validate -json reports an undeclared variable and exits with 1.
+    mkdir invalid
+    printf '%s\n' 'output "x" {' '  value = var.missing' '}' > invalid/main.tf
+    if tofu -chdir=invalid validate -json > validate.json 2>&1; then status=0; else status=$?; fi
+    test "$status" -eq 1 || { cat validate.json >&2; echo "expected exit status 1, got $status" >&2; exit 1; }
+    grep -Fq '"valid": false,' validate.json || { cat validate.json >&2; exit 1; }
+    grep -Fq 'Reference to undeclared input variable' validate.json || { cat validate.json >&2; exit 1; }
+examples:
+  - title: Download the providers and modules of the configuration in the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/opentofu init
+  - title: Show the changes that applying the configuration would make
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/opentofu plan
+  - title: Check the formatting of every file below the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/opentofu fmt -check -recursive
+  - title: Run the tests in tests/
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/opentofu test
+combos:
+  - with: [openssh-client]
+    default: true
+    base: opentofu
+    summary: OpenTofu with Git and the OpenSSH client, for modules from the OpenTofu registry and from Git repositories over HTTPS or SSH.
+    extras:
+      alpine: {packages: [git]}
+      ubuntu: {packages: [git]}
+    extras-license: GPL-2.0-only
+    test:
+      - |
+        # A module sourced with git:: from a tag in a local repository.
+        mkdir -p git/mods git/root
+        cd git || exit 1
+        cat > mods/main.tf <<'EOF'
+        variable "who" {
+          type = string
+        }
+
+        output "text" {
+          value = "hello ${var.who} from git"
+        }
+        EOF
+        git -c init.defaultBranch=main init -q mods
+        git -C mods add main.tf
+        git -C mods -c user.name=test -c user.email=test@example.invalid commit -q -m 'Add the module'
+        git -C mods tag v1
+        printf '%s\n' 'module "greet" {' "  source = \"git::file://$PWD/mods?ref=v1\"" '  who    = "world"' '}' \
+          '' 'output "greeting" {' '  value = module.greet.text' '}' > root/main.tf
+        tofu -chdir=root init -input=false -no-color > init.txt 2>&1 || { cat init.txt >&2; exit 1; }
+        tofu -chdir=root apply -auto-approve -input=false -no-color > apply.txt 2>&1 || { cat apply.txt >&2; exit 1; }
+        tofu -chdir=root output -raw greeting > greeting.txt
+        printf 'hello world from git' > greeting.want
+        cmp greeting.want greeting.txt || { cat greeting.txt >&2; exit 1; }
+      - |
+        # git runs ssh from PATH, the OpenSSH client's wrapper, which works for
+        # a UID without a passwd entry. Nothing listens on port 9.
+        command -v ssh > ssh-path.txt
+        printf '%s\n' /usr/local/bin/ssh > ssh-path.want
+        cmp ssh-path.want ssh-path.txt || { cat ssh-path.txt >&2; exit 1; }
+        if git ls-remote ssh://git@127.0.0.1:9/mods.git > ls-remote.txt 2>&1; then
+          cat ls-remote.txt >&2; echo "git ls-remote over ssh succeeded" >&2; exit 1
+        fi
+        grep -Fq 'ssh: connect to host 127.0.0.1 port 9: Connection refused' ls-remote.txt \
+          || { cat ls-remote.txt >&2; exit 1; }

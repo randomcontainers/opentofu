@@ -1,0 +1,165 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends \
+      binutils \
+      ca-certificates \
+      curl \
+      git; \
+    rm -rf /var/lib/apt/lists/*
+
+# Go comes from go.dev instead of the distro, so that both distros build with
+# the same release and get Go's security fixes when Go publishes them. Update
+# the version and both checksums together, from https://go.dev/dl/.
+# GOTOOLCHAIN=local keeps go from downloading another toolchain: OpenTofu
+# often raises the go line of its go.mod in a patch release, and a release
+# that needs a newer Go fails to build until the pin is raised.
+ARG GO_TOOLCHAIN=go1.27.2
+ARG GO_TOOLCHAIN_AMD64_SHA256=ecbadb99091a3f46e31f5f934b068b1864eafa7995211b39eaddf76996045fe5
+ARG GO_TOOLCHAIN_ARM64_SHA256=94f3e30b8e374bc285e7dadc11e0865726b9bc6e85b841ccceaabc0214c6b7c8
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+      amd64) sha256="${GO_TOOLCHAIN_AMD64_SHA256}" ;; \
+      arm64) sha256="${GO_TOOLCHAIN_ARM64_SHA256}" ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o /tmp/go.tar.gz \
+      "https://dl.google.com/go/${GO_TOOLCHAIN}.linux-${TARGETARCH}.tar.gz"; \
+    echo "${sha256}  /tmp/go.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/go.tar.gz -C /usr/local; \
+    rm /tmp/go.tar.gz; \
+    test "$(/usr/local/go/bin/go env GOVERSION)" = "${GO_TOOLCHAIN}"
+# Modules come only from the Go module proxy and are checked against
+# OpenTofu's go.sum. Without cgo the binary is static.
+ENV PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    GOTOOLCHAIN=local \
+    GOPROXY=https://proxy.golang.org \
+    GOSUMDB=sum.golang.org \
+    CGO_ENABLED=0
+
+# OpenTofu publishes prebuilt binaries but no source tarball, so the release
+# tag is cloned and must point to the commit pinned in package.yml.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v${VERSION}" \
+      https://github.com/opentofu/opentofu.git /src/opentofu; \
+    test "$(git -C /src/opentofu rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
+    test "$(cat /src/opentofu/version/VERSION)" = "${VERSION}" \
+      || { echo "version/VERSION does not say ${VERSION}" >&2; exit 1; }
+WORKDIR /src/opentofu
+ARG JOBS
+# The flags are those of upstream's .goreleaser.yaml. version.dev=no drops the
+# -dev suffix from the version; version.officialBuild stays empty, as it
+# should for builds made outside the OpenTofu project. Modules are checked
+# against go.sum, which -mod=readonly keeps as it is, and the checkout stays in
+# place so that the binary records the commit (go version -m shows it).
+RUN mkdir -p /out/usr/local/bin; \
+    go build -mod=readonly -trimpath -buildvcs=true -p "${JOBS:-$(nproc)}" \
+      -ldflags "-s -w -X github.com/opentofu/opentofu/version.dev=no" \
+      -o /out/usr/local/bin/tofu ./cmd/tofu; \
+    go mod verify; \
+    bin=/out/usr/local/bin/tofu; \
+    "$bin" version > /tmp/tofu-version; \
+    printf '%s\n' "OpenTofu v${VERSION}" "on linux_${TARGETARCH}" > /tmp/tofu-version.want; \
+    cmp /tmp/tofu-version.want /tmp/tofu-version || { cat /tmp/tofu-version >&2; exit 1; }; \
+    go version -m "$bin" > /tmp/tofu-modules; \
+    awk -F '\t' '$2 == "build" { print $3 }' /tmp/tofu-modules > /tmp/tofu-build; \
+    for setting in "vcs.revision=${SOURCE_COMMIT}" vcs.modified=false CGO_ENABLED=0 -trimpath=true; do \
+      grep -Fqx -- "$setting" /tmp/tofu-build \
+        || { cat /tmp/tofu-modules >&2; echo "missing build setting: $setting" >&2; exit 1; }; \
+    done; \
+    readelf -lW "$bin" > /tmp/tofu-elf; \
+    if grep -Eq '^ +(INTERP|DYNAMIC) ' /tmp/tofu-elf; then \
+      cat /tmp/tofu-elf >&2; echo "tofu is not statically linked" >&2; exit 1; \
+    fi
+
+ARG BASE_IMAGE
+# go-licenses.sh copies the license files at the root of each Go module linked
+# into tofu, and those of the Go distribution. The loops before it add the
+# files kept below a module's root, in the directory of a linked package or in
+# a directory between it and the root, such as OpenTofu's internal/ipaddr
+# (code from Go's net package) and k8s.io/apimachinery's
+# third_party/forked/golang. go-textseg v17 generates its tables from Unicode
+# data and keeps the data's license in textseg/internal/charprops/ucd, which
+# is not a package, so a ucd directory next to a linked package is read too.
+# Go files whose names start like a license file (lib/pq has a notice.go) are
+# left out. mpl-sources.sh copies the source zips of the MPL-2.0 modules; the
+# source of OpenTofu itself is attached to this repository's release of each
+# version. The binary loads no libraries, so runtime-deps only has the
+# packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=scripts/go-licenses.sh,target=/tmp/go-licenses.sh \
+    --mount=type=bind,source=scripts/mpl-sources.sh,target=/tmp/mpl-sources.sh \
+    --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    meta=/out/usr/local/share/randomcontainers/opentofu; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE "$meta/licenses/LICENSE"; \
+    go list -deps -f '{{if .Module}}{{with .Module.Replace}}{{.Path}} {{.Dir}}{{else}}{{.Module.Path}} {{.Module.Dir}}{{end}} {{.Dir}}{{end}}' \
+      ./cmd/tofu | LC_ALL=C sort -u > /tmp/packages; \
+    test -s /tmp/packages; \
+    while read -r mod moddir dir; do \
+      case "$dir" in "$moddir"/*) ;; *) continue ;; esac; \
+      sub="${dir#"$moddir"}"; \
+      if [ -d "$dir/ucd" ]; then echo "$mod $moddir $sub/ucd"; fi; \
+      while [ -n "$sub" ]; do echo "$mod $moddir $sub"; sub="${sub%/*}"; done; \
+    done < /tmp/packages | LC_ALL=C sort -u > /tmp/license-dirs; \
+    while read -r mod moddir sub; do \
+      for f in "$moddir$sub"/*; do \
+        case "${f##*/}" in \
+          *.go) ;; \
+          [Ll][Ii][Cc][Ee][Nn][CcSs][Ee]* | [Cc][Oo][Pp][Yy][Ii][Nn][Gg]* | \
+          [Nn][Oo][Tt][Ii][Cc][Ee]* | [Pp][Aa][Tt][Ee][Nn][Tt][Ss]*) \
+            if [ -f "$f" ]; then mkdir -p "$meta/licenses/${mod}${sub}"; cp "$f" "$meta/licenses/${mod}${sub}/"; fi ;; \
+        esac; \
+      done; \
+    done < /tmp/license-dirs; \
+    sh /tmp/go-licenses.sh /out/usr/local/bin/tofu "$meta/licenses"; \
+    find "$meta/licenses" -type f -name '*.go' -delete; \
+    if find "$meta/licenses" -type f -size 0 | grep .; then echo "empty license file" >&2; exit 1; fi; \
+    if awk '$1 == "github.com/apparentlymart/go-textseg/v17" { found = 1 } END { exit !found }' /tmp/packages; then \
+      test -s "$meta/licenses/github.com/apparentlymart/go-textseg/v17/textseg/internal/charprops/ucd/license.txt" \
+        || { echo "go-textseg/v17 is linked, but the license of its Unicode data was not copied" >&2; exit 1; }; \
+    fi; \
+    sh /tmp/mpl-sources.sh /out/usr/local/bin/tofu "$meta/mpl-sources" > /tmp/mpl-sources; \
+    test -s /tmp/mpl-sources; \
+    echo "MPL-2.0 module sources: $(wc -l < /tmp/mpl-sources)"; \
+    echo "${VERSION}" > "$meta/version"; \
+    { \
+      echo "https://github.com/opentofu/opentofu.git@${SOURCE_COMMIT}"; \
+      echo "https://github.com/opentofu/opentofu/tree/${SOURCE_COMMIT}"; \
+      sed 's|^|/usr/local/share/randomcontainers/opentofu/mpl-sources/|' /tmp/mpl-sources; \
+      echo "https://github.com/randomcontainers/opentofu/releases/tag/v${VERSION}"; \
+    } > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "go: $(go env GOVERSION)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      cat /tmp/tofu-version; \
+      sed 1d /tmp/tofu-modules; \
+    } > "$meta/buildinfo"; \
+    LC_ALL=C sort -u /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/opentofu/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "tofu"]
+CMD ["--help"]

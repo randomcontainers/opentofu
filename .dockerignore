@@ -1,4 +1,5 @@
 *
+!runtime-deps.alpine
 !runtime-deps.ubuntu
 !scripts/go-licenses.sh
 !scripts/mpl-sources.sh

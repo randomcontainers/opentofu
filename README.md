@@ -113,7 +113,7 @@ The Go version, the commit and every Go module with its version and checksum are
 
 ## Default or slim
 
-Use the default image (`latest`) for general work: modules from the registry and from Git repositories need Git, and Git over SSH needs `ssh`. `slim` has `tofu` alone. Use it as the base for your own image, or for configurations that use providers and local modules only.
+Use the default image (`latest`) for general work: modules from the registry and from Git repositories need Git, and Git over SSH needs `ssh`. `slim` has `tofu` alone. Use it as the base for your own image, or for configurations that use providers and local modules only. The default image of [Terragrunt](https://github.com/randomcontainers/terragrunt) includes this build of OpenTofu.
 
 The default image includes Git, which is licensed under the GNU General Public License (GPL-2.0-only). Use `slim` if your policy excludes GPL software. The default image is also published as `ghcr.io/randomcontainers/opentofu-openssh-client`, built in the [opentofu-openssh-client](https://github.com/randomcontainers/opentofu-openssh-client) repository with the same contents and a different digest.
 

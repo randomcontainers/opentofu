@@ -22,13 +22,13 @@ upstream:
   tag-pattern: '^v(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
-  version: 1.13.2
+  version: 1.13.8
   # The release assets are prebuilt binaries and packages, with no source
   # tarball, so the build compiles the tag.
   git:
     url: https://github.com/opentofu/opentofu.git
     tag: v{version}
-    commit: 765062032c46cacab116b36d714db098b806dede
+    commit: 875304b166e8e44c74d2e0f42b3e803a362c7dbe
 image:
   entrypoint: [tofu]
   cmd: [--help]
